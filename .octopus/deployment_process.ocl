@@ -4,13 +4,21 @@ step "run-a-script" {
     action {
         action_type = "Octopus.Script"
         properties = {
-            Octopus.Action.Script.ScriptBody = <<-EOT
-                echo "Hello, world"
-                echo $( set_octopusvariable message "Hello, World!")
-                EOT
-            Octopus.Action.Script.ScriptSource = "Inline"
-            Octopus.Action.Script.Syntax = "Bash"
+            Octopus.Action.Package.DownloadOnTentacle = "False"
+            Octopus.Action.Package.FeedId = "james-test-feed"
+            Octopus.Action.Package.PackageId = "jduclos386/octo"
+            Octopus.Action.Script.ScriptFileName = "scripts\\hello_world.sh"
+            Octopus.Action.Script.ScriptSource = "Package"
         }
         worker_pool = "linux-agents"
+
+        packages {
+            acquisition_location = "Server"
+            feed = "james-test-feed"
+            package_id = "jduclos386/octo"
+            properties = {
+                SelectionMode = "immediate"
+            }
+        }
     }
 }
