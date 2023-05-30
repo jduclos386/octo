@@ -1,0 +1,89 @@
+#!/bin/bash
+
+function login(){
+  passwordFile=$1
+  bw login --apikey --raw
+  echo $(bw unlock --passwordfile $passwordFile --raw)
+}
+
+function loginUsingPassword(){
+  export BW_PASSWORD=$1
+  bw login --apikey --raw
+  echo $(bw unlock --passwordenv BW_PASSWORD --raw)
+}
+
+function logout(){
+  bw logout
+}
+
+function sync(){
+  bw sync --session $1
+}
+
+function loadAccount(){
+  passwordResult=$(getEntry password $1 $2)
+  echo $passwordResult
+}
+
+function getCustomField(){
+  fieldName=$1
+  item=$(getItem $2 $3)
+  echo $(echo $item | jq -c '.fields[] | select(.name == "'$fieldName'") | .value')
+}
+
+function getName(){
+  item=$(getItem $1 $2)
+  name=$(echo $item | jq -c '.name')
+  # remove acadmin@advisorsexcel.com. from the name and replace space with `_`
+  name=${name#"acadmin@advisorsexcel.com."}
+  echo ${name// /_}
+}
+
+function getUserName(){
+  echo $(bw get username $1 --session $2)
+}
+
+function getUri(){
+  item=$(getItem $1 $2)
+  echo $(echo $item | jq -c '.login.uris[0].uri')
+}
+
+function getItem() {
+  echo $(getEntry item $1 $2)
+}
+
+function getEntry(){
+  echo $(bw get $1 $2 --session "$3")
+}
+
+function getAll(){
+  echo $(bw list items --session "$1")
+}
+
+function getSession(){
+  passFile=$1
+  
+  (
+    # Wait for lock on /var/advisorscommand/.bw.exclusivelock (fd 200) for 10 seconds
+    flock -o -x -w 60 200 || exit 1
+    sessionFile=/tmp/bw.session
+    if [ ! -f "$sessionFile" ]; then
+      # session file does not exist.  Create the file
+      session=$(login "$passFile")
+      echo $session > $sessionFile
+    else
+      createdTime=$(date -d "now - $( stat -c "%Y" $sessionFile ) seconds" +%s)
+      if [ $createdTime -gt 300 ]; then # file was created more than 5 minutes ago
+        # remove the session file so that it is recreated.
+        rm -f $sessionFile
+      fi
+      
+      if ! test -f "$sessionFile"; then
+        # session file does not exist.  Create the file
+        session=$(login "$passFile")
+        echo $session > $sessionFile
+      fi
+    fi
+    echo $(cat $sessionFile)
+  ) 200>/tmp/.bw.exclusivelock
+}

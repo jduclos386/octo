@@ -1,0 +1,296 @@
+#!/bin/bash
+function getVersions(){
+  echo $(sfdx force:data:soql:query -u $1 -q "SELECT Id, name,command__Status__c FROM command__mdMetadataVersions__c WHERE command__status__c ='Completed' ORDER BY name ASC" --json)
+}
+
+function getAllVersions(){
+  echo $(sfdx force:data:soql:query -u $1 -q "SELECT Id, name,command__Status__c FROM command__mdMetadataVersions__c ORDER BY name ASC" --json)
+}
+
+function query(){
+  query=$2
+  format="${3:'json'}"
+  echo $(sfdx force:data:soql:query -u $1 -q "$query" --$format)
+}
+
+__executeCommand(){
+  echo $(echo "$1" | sfdx force:apex:execute -u $2 )
+}
+
+function setupCronJobs(){
+  echo $(__executeCommand "command.AEDataFeedGlobal.cronSetup();" $1)
+}
+
+function resyncPolicies(){
+  echo $(__executeCommand "command.AEDataFeedGlobal.reSyncPolicies();" $1)
+}
+
+function syncProducts(){
+  echo $(__executeCommand "command.AEDataFeedGlobal.getAllProducts();" $1)
+}
+
+function listPackages(){
+ user=$1
+ packageId=$2
+ echo $(sfdx force:package1:version:list -u $1  -i $2 --json)
+}
+
+function getInstalledPackages(){
+  echo $(sfdx force:package:installed:list -u $1 --json)
+}
+
+function runMetadataVersion(){
+  version=$(echo $1 | tr -d '"')
+  user=$2
+  echo $(__executeCommand "command.mdInstructionsRestController.post('"$version"');" $user)
+}
+
+function verifyMetadataWasCompleted(){
+  version=$(echo $1 | tr -d '"')
+  user=$2
+  
+  #This is needed for the delay that salesforce has while updating the version record.
+  sleep 15
+  
+  versionStatus="true"
+  retryAttempts=5
+  while [ $versionStatus == "true" ]
+  do
+  	for (( attempts = 0; attempts <= $retryAttempts; attempts++ ))
+	do 
+   		queryResult=$(sfdx force:data:soql:query -u $user -q "SELECT Id, name,command__Status__c FROM command__mdMetadataVersions__c WHERE name='"$version"' ORDER BY LastModifiedDate DESC LIMIT 1" --json)
+		recordStatus=$(echo $queryResult | jq '.result.records[].command__Status__c')
+    	if [[ $(echo $recordStatus | tr -d '"') == "Pending" ]]; then
+      		echo "Version is installing, sleeping for 30 seconds."
+      		sleep 30
+    	elif [[ $attempts -le $retryAttempts ]] && [[ -z "$recordStatus" ]]; then
+        	echo "Version record has not updated in the org, retrying."
+     		sleep 5
+    	else
+      		versionStatus="false"
+            break
+    	fi
+	done
+  done
+
+  numberOfRecords=$(echo $queryResult | jq '.result.totalSize')
+  if [[ $recordLength ==  "0" ]]; then
+    # nothing returned this version has not been applied successfully
+    return 1;
+  else
+    recordStatus=$(echo $queryResult | jq '.result.records[].command__Status__c')
+    if [[ $(echo $recordStatus | tr -d '"') == "Completed" ]]; then
+      return 0;
+    else
+      return 2;
+    fi
+  fi
+}
+
+function outputMetadataLog(){
+  version=$(echo $1 | tr -d '"')
+  user=$2
+  directory=$3
+
+  mkdir -p -m 777 $directory
+  
+  fullFileName="$directory/$version.csv"
+  rm -rf $fullFileName
+
+  $(sfdx force:data:soql:query -u $user -q "SELECT command__time__c, command__Version__c, command__Correlation_Id__c, command__type__c, command__level__c, command__Message__c, command__exception__c, command__stack__c FROM command__mdMetadataLog__c WHERE command__Version__c='"$version"' ORDER BY Name" -r csv >> $fullFileName)
+  echo $fullFileName
+}
+
+function createSandbox(){
+  orgName=$1
+  alias=$2
+  directory="/tmp/config/"
+  definitionFile=$(createDefinitionFile $orgName $directory $alias)
+  # sandboxAlias=$3
+  user=$4
+  waitTime=$5
+
+  echo $(sfdx force:org:create --type sandbox --targetusername $user --definitionfile "$directory$definitionFile" -a $alias -w $waitTime)
+}
+
+function createDefinitionFile(){
+  if [[ ! -d "$2" ]]; then
+    mkdir "$2"
+  fi  
+  
+  orgName=$1
+  directory=$2
+  alias=$3
+  
+  if [ -z "$alias" ]; then
+  	fileName="$orgName-$alias-def.json"
+  else
+  	fileName="$orgName-def.json"
+  fi
+  fullFileName="$directory$fileName"
+  $(rm -f $fullFileName)
+  
+  if [ -z "$alias" ]; then
+      $(echo '{
+        "sandboxName": "'$alias'",
+        "licenseType": "Developer",
+        "autoActivate": true
+    }' >>  $fullFileName)
+  else
+  	$(echo '{
+        "licenseType": "Developer",
+        "autoActivate": true
+    }' >>  $fullFileName)
+  fi
+  
+  
+  echo $fileName
+}
+
+function installPackage(){
+  packageId=$1
+  installationKey=$2
+  user=$3
+  # NOTE: If we get to a point where we are creating the package from 
+  # the deployment server we will likely need to specify 
+  # -b | --publishwait TIME
+  # This is the amount of time in minutes to wait for the package to become
+  # available before canceling.  There is a delay between when a package is
+  # published and when it is available to install.
+  
+  output=$(sf package install --target-org $user -p $packageId -s AllUsers -r -w 30 --json -k $installationKey)
+  
+  echo $output
+}
+
+function getInstallReport(){
+  reportId=$1
+  user=$2
+  echo $(sfdx package install report --target-org $user -i $reportId)
+}
+
+function waitForReport(){
+  reportId=$1
+  user=$2
+  packageStatus="true"
+  packageInstallStatus="PackageInstallRequest is currently InProgress"
+  while [ $packageStatus == "true" ]
+  do
+    installReport=$(getInstallReport "$reportId" $user)
+    if [[ $installReport == $packageInstallStatus* ]]; then
+      echo "Package is installing, sleeping for 10 seconds."
+      sleep 10
+    else
+      packageStatus="false"
+    fi
+  done
+}
+
+function getReportIdFromRequest(){
+  # Trims the package install response down to the reportId 
+  #installPackageResult=$1
+  #user=$2
+  #prefix="PackageInstallRequest is currently InProgress. You can continue to query the status using sfdx package:install:report -i "
+  #suffix=" -o $user"
+  
+  #reportId=${installPackageResult#$prefix}
+  #reportId=${reportId%$suffix}
+  #echo $reportId
+  
+  echo $(echo "$1" | jq -r '.result.Id')
+}
+
+function grantSfdxAccess(){
+  consumerKey=$(echo $1 | tr -d '"') # remove any quotes around the key
+  keyFile=$2
+  instanceUrl=$(echo $3 | tr -d '"') # remove any quotes around the url
+  connectionAlias=$4
+  user=$5
+  
+  echo $(sfdx auth:jwt:grant --client-id $consumerKey \
+  --jwt-key-file "$keyFile" --username $user \
+  --alias $connectionAlias -r $instanceUrl)
+}
+
+function getConnectedAppLogin(){
+  consumerKey="$1"
+  isSandbox="${2:false}" # if the isSandbox parameter is not specified default to false
+  
+  loginLocation="login"
+  if [ "$isSandbox" = "true" ] ; then loginLocation="test"; fi
+
+  loginResult=$(curl -sS -X GET -D - -o /dev/null "https://$loginLocation.salesforce.com/services/oauth2/authorize?response_type=code&redirect_uri=https://$loginLocation.salesforce.com/services/oauth2/success&client_id=$consumerKey")
+  echo $(echo $loginResult | grep "Location:")
+}
+
+function getAccessToken(){
+  secret=$1
+  key=$2
+  code=$3
+  isSandbox="${4:false}" # if the isSandbox parameter is not specified default to false
+  
+  loginLocation="login"
+  if [ "$isSandbox" = "true" ] ; then loginLocation="test"; fi
+  echo "https://$loginLocation.salesforce.com/services/oauth2/token?grant_type=authorization_code&redirect_uri=https://$loginLocation.salesforce.com/services/oauth2/success&client_secret=$secret&client_id=$key&code=$code"
+
+  echo $(curl -X POST "https://$loginLocation.salesforce.com/services/oauth2/token?grant_type=authorization_code&redirect_uri=https://$loginLocation.salesforce.com/services/oauth2/success&client_secret=$secret&client_id=$key&code=$code")
+}
+
+function initializeRefreshToken(){
+  clientId=$1
+  redirectUri=$2
+
+  # url="$host/services/oauth2/authorize?response_type=token&client_id=$clientId&redirect_uri=$redirectUri"
+  # ?response_type=token&consumer_key=$clientId&redirect_uri=$host/services/oauth2/success
+  url="$host/services/oauth2/token"
+  jwt=$(createJwt $clientId $host $user)
+  echo "jwt: $jwt ##"
+  # echo curlCommand
+  
+  echo $(curl -sS --location --request POST $url \
+  --header "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
+  --data-urlencode "assertion=$jwt" )
+}
+
+function createJwt(){
+  iss=$1 # the client Id of the connected app
+  aud=$2 # the auth server.  login.salesforce.com or test.salesforce.com
+  sub=$3 # username 
+
+  header='{"alg": "RS256"}'
+  claimset='{
+    "iss": "'$iss'",
+    "aud": "'$aud'",
+    "sub": "'$sub'"
+  }'
+  # include the expiration time in the claimset, 3 min from now.
+  claimset=$(
+      echo "${claimset}" | jq --arg time_str "$(date +%s)" \
+      '
+      ($time_str | tonumber) as $time_num
+      | .exp=($time_num + 60)
+      '
+  )
+
+  encodedHeader=$(echo "${header}" | json | base64)
+  encodedClaimset=$(echo "${claimset}" | json | base64)
+  payload="$encodedHeader.$encodedClaimset"
+  signedPayload=$(echo $payload | rsaSign)
+  encodedSignedPayload=$(echo $signedPayload | base64)
+  echo "$payload.$encodedSignedPayload"
+}
+
+json() {
+    declare input=${1:-$(</dev/stdin)}
+    printf '%s' "${input}" | jq -c .
+}
+rsaSign()
+{
+    declare input=${1:-$(</dev/stdin)}
+    printf '%s' "${input}" | openssl dgst -binary -sha256 -sign $keyFile -hmac
+}
+opensslEncode(){
+  declare input=${1:-$(</dev/stdin)}
+  printf '%s' "${input}" | openssl base64 -A
+}
